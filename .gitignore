@@ -1,0 +1,14 @@
+# UV virutal env
+.venv
+
+# Don't track any of our data files
+bids/*
+# But do track the .gitkeep file
+!bids/.gitkeep
+
+# Ditto
+derivatives/*
+!derivatives/.gitkeep
+
+# VS code workspace
+*.code-workspace
