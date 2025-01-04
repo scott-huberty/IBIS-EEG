@@ -9,3 +9,6 @@ dependencies = [
     "seaborn>=0.13.2",
     "xarray>=2025.1.0",
 ]
+
+[project.optional-dependencies]
+notebook = ["ipykernel>=6.29.5"]
