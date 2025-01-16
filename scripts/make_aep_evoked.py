@@ -20,6 +20,9 @@ no_tone_event = []
 def main():
     xr_evokeds = []
     bids_root = Path(__file__).resolve().parent.parent / "bids"
+    derivatives_root = bids_root.parent / "derivatives"
+    out_dir = derivatives_root / "evoked" / "v2_online-reference"
+
     fpaths = glob.glob(f"{bids_root}/sub-*/ses-*/eeg/*.vhdr")
     for fpath in fpaths:
        bids_path = mne_bids.get_bids_path_from_fname(fpath)
@@ -28,10 +31,10 @@ def main():
        if this_ev is None:
            continue
        new_name = Path(fpath).name.replace(".vhdr", "_evoked.zarr")
-       derivatives_root = bids_root.parent.parent / "derivatives"
-       out_path = derivatives_root / "evoked" / f"sub-{bids_path.subject}" / f"ses-{bids_path.session}" / new_name
+       out_path = out_dir / f"sub-{bids_path.subject}" / f"ses-{bids_path.session}" / new_name
        # out_path.parent.mkdir(exist_ok=True, parents=True)
        # this_ev.to_zarr(str(out_path))
+       out_path.parent.mkdir(exist_ok=True, parents=True)
        this_ev.to_dataset(dim="subject").to_netcdf(str(out_path).replace(".zarr", ".nc"))
        evoked.save(str(out_path).replace(".zarr", ".fif"), overwrite=True)
        xr_evokeds.append(this_ev)
@@ -39,11 +42,9 @@ def main():
     xr_evokeds.attrs.pop("fpath")
     xr_evokeds.attrs.pop("bads")
     xr_evokeds.attrs.pop("n_bads")
-    out_path = derivatives_root / "evoked" / "aep_evoked.zarr"
+    out_path = out_dir / "aep_evoked.zarr"
     # xr_evokeds.to_zarr(str(out_path))
     xr_evokeds.to_netcdf(str(out_path).replace(".zarr", ".nc"))
-    with open("./no_tone_event.txt", "w") as f:
-        f.write("\n".join((str(fpath) for fpath in no_tone_event)))
 
 def get_xr_evoked_aep(raw, bids_path):
 
@@ -57,9 +58,9 @@ def get_xr_evoked_aep(raw, bids_path):
     assert len(raw.ch_names) == 129
 
     epochs = mne.Epochs(raw, event_id="tone", reject=dict(eeg=200e-6), preload=True)
-    epochs.set_eeg_reference(
-        ref_channels=[ch for ch in epochs.ch_names if ch not in epochs.info["bads"]]
-        )
+    #epochs.set_eeg_reference(
+    #    ref_channels=[ch for ch in epochs.ch_names if ch not in epochs.info["bads"]]
+    #    )
     epochs.interpolate_bads()
     evoked = epochs.average()
     xr_ev = xr.DataArray(
@@ -77,7 +78,7 @@ def get_xr_evoked_aep(raw, bids_path):
             "filter": eeg_filter,
             "sfreq": sfreq,
             "nave": len(epochs),
-            "reference": "Robust average",
+            "reference": "VREF (online)",
             "montage": "GSN-HydroCel-129",
             "epoch_length": "-200-500ms",
             "baseline": "-200-0ms"
