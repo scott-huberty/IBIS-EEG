@@ -33,6 +33,12 @@ KNOWN_PROBLEMATIC = [
     "STL7100_6m_20220520_094102_cleaned_raw.fif",
     # Most of the UNC files probably need to be inspected manually
     "UNC_7041_v06_20220923_0906_cleaned_raw.fif",
+    # These are files that I didnt initially process.abs
+    "STL7071_12m_20220624_015409_cleaned_raw.fif", # No DINS
+    "STL7052_12m_2_20220221_114009_cleaned_raw.fif", # Some DINS far from ton+ events
+    "STL7049_12m_20210806_090442_cleaned_raw.fif", # No DINS
+    "STL7054_6M_20211001_014249_cleaned_raw.fif", # No DINS
+    "STL7151_6m_20230915_020759_cleaned_raw.fif", # some tones too close together
 ]
 
 
@@ -74,6 +80,7 @@ def get_fpaths_dataframe(run: str = "01") -> pd.DataFrame:
     fpaths["STL"] = get_fpaths(site="STL", run=run)
     fpaths["UMN"] = get_fpaths(site="UMN", run=run)
     fpaths["UNC"] = get_fpaths(site="UNC", run=run)
+    fpaths["extra"] = list(Path(__file__).resolve().parent.parent.glob("derivatives/pylossless/run-02/*_cleaned_raw.fif"))
     fpaths = [fpath for fpath in fpaths.values() for fpath in fpath]
     df = pd.DataFrame(
         {
@@ -212,16 +219,30 @@ def sanitize_aep_events(raw) -> None:
     # UNC Does not have DIN1 events. They have both DIN193 and DIN199 events that are
     # continuously dropped throughout the task. Keep the closest one to the ton+ event,
     # rename it to DIN1, and delete the rest.
+    rename_dins = False
     if raw.filenames[0].name.lower().startswith("unc"):
+        rename_dins = True
         dins_in_raw = np.unique(raw.annotations.description)
         dins_in_raw = [din for din in dins_in_raw if din.startswith("D")]
+    # Some files have DIN2 events instead of DIN1 events. We'll rename them to DIN1
+    elif raw.filenames[0].name in ["SEA7033_12M_20220201_105005_cleaned_raw.fif"]:
+        rename_dins = True
+        dins_in_raw = np.unique(raw.annotations.description)
+        dins_in_raw = [din for din in dins_in_raw if din.startswith("DIN2")]
+    if rename_dins:
         din_map = {
             din: "DIN1" for din in dins_in_raw
-        }
+            }
         raw.annotations.rename(din_map)
+        rename_dins = False
+
 
     current_annotations = raw.annotations
-    aep_events = ["ton+", "DIN1"]
+    aep_events = [
+        "ton+",
+        "DIN1",
+        "DIN2" # e.g. SEA7033_12M_20220201_105005_cleaned_raw.fif has DIN2 events
+        ]
     want_cond = (
         np.isin(current_annotations.description, aep_events) |
         np.char.startswith(current_annotations.description,"BAD_")
@@ -247,6 +268,13 @@ def sanitize_aep_events(raw) -> None:
         "UMN7037_v6_20230620_100742_cleaned_raw.fif", # a few tones just over 2sec apart
         # A lot of UNC files, the first ton+ event has no DIN1 event within 50ms of it
         "UNC7024_V6_20220322_0913_cleaned_raw.fif", # a tone over 2sec apart
+        # The files below are the second batch I processed.abs
+        "UNC7017_12m 20220221 1446_cleaned_raw.fif", # a tone over 2sec apart
+        "UMN7042_v6_cleaned_raw.fif",  # some tones just over 2sec apart
+        "UMN7015_12mo_20220222_101741_cleaned_raw.fif", # some tones just over 2sec apart
+        "UNC7047_v06 20230303 0920_cleaned_raw.fif", # some tones just over 2sec apart
+        "UMN7024_6mo_20220617_101125_cleaned_raw.fif", # some tones just over 2sec apart
+        "UMN7049_v6_20230715_113354_cleaned_raw.fif", # some tones just over 2sec apart
     ]
     if raw.filenames[0].name not in KNOWN_DEVIATIONS:
         diffs = np.diff(true_tone_annots.onset)
@@ -280,6 +308,7 @@ def get_true_tone_annotations(raw, threshold=.05):
         # is_first_din = False
         threshold = threshold  # time in ms, i.e. 0.05 seconds = 50ms
         if annot["description"] == "ton+":
+            # compare onset of this ton+ event to all other events.
             diffs = np.abs(raw.annotations.onset - annot["onset"]) < threshold
             diffs_indices = np.where(diffs)[0]
             # The current annotation will be included in the diff calculation (with a diff of 0) so we need to remove it
@@ -289,6 +318,9 @@ def get_true_tone_annotations(raw, threshold=.05):
             if len(diffs_indices) == 0:
                 # For some reason in the UNC site, the first ton+ event has no DIN1 event within 50ms of it
                 if raw.filenames[0].name.lower().startswith("unc") and ii == 1:
+                    continue
+                # The first ton+ in this file has no DIN1 event within 50ms of it
+                elif raw.filenames[0].name in ["SEA7033_12M_20220201_105005_cleaned_raw.fif"]:
                     continue
                 raise ValueError(f"No DIN1 found within {threshold} seconds of this ton+ annotation: {annot}")
             # Since the  UNC site continuously drops D192 and D193 events, there

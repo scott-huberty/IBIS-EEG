@@ -21,9 +21,12 @@ def main(fpath) -> None:
     raw = mne_bids.read_raw_bids(bids_path)
     raw.load_data()
     raw.filter(None, 40)
-    raw.set_montage("GSN-HydroCel-129", match_alias=True)
+    if len(raw.ch_names) == 65:
+        raw.set_montage("GSN-HydroCel-65_1.0", match_alias=True)
+    else:
+        raw.set_montage("GSN-HydroCel-129", match_alias=True)
 
-    derivatives_root = bids_path.root.parent.parent / "derivatives" / "data_quality"
+    derivatives_root = bids_path.root.parent.parent / "derivatives" / "data_quality" / "batch_2"
     
     this_derivative_dir = derivatives_root / bids_path.subject / bids_path.session
     this_derivative_dir.mkdir(exist_ok=True, parents=True)
@@ -47,6 +50,8 @@ def main(fpath) -> None:
     plt.close()
 
     channels = ["E7", "E106", "E13", "E6", "E112", "E31", "E80", "E37", "E55", "E87"]
+    if len(epochs.ch_names) == 65:
+        return
     fig = epochs.average().pick(channels).plot(show=False)
     fig.savefig(this_derivative_dir / this_fname.name.replace(".eeg", "_proc-minimal_evoked-plot.png"))
     plt.close()
@@ -100,7 +105,7 @@ def main(fpath) -> None:
     plt.close()
 
 if __name__ == "__main__":
-    bids_root = Path(__file__).resolve().parent.parent / "bids"
+    bids_root = Path(__file__).resolve().parent.parent / "bids" / "v2"
     assert bids_root.exists()
     fpaths = glob.glob(f"{bids_root}/sub-*/ses-*/eeg/*.vhdr")
     assert len(fpaths)

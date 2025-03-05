@@ -21,12 +21,14 @@ def main():
     xr_evokeds = []
     bids_root = Path(__file__).resolve().parent.parent / "bids"
     derivatives_root = bids_root.parent / "derivatives"
-    out_dir = derivatives_root / "evoked" / "v2_online-reference"
+    out_dir = derivatives_root / "evoked" / "v2_online-reference" / "batch_2"
 
-    fpaths = glob.glob(f"{bids_root}/sub-*/ses-*/eeg/*.vhdr")
+    fpaths = glob.glob(f"{bids_root}/v2/sub-*/ses-*/eeg/*.vhdr")
     for fpath in fpaths:
        bids_path = mne_bids.get_bids_path_from_fname(fpath)
        raw = mne_bids.read_raw_bids(bids_path)
+       if len(raw.ch_names) == 65:
+           continue
        this_ev, evoked = get_xr_evoked_aep(raw, bids_path)
        if this_ev is None:
            continue

@@ -302,7 +302,7 @@ def main(
     pd.DataFrame
         DataFrame containing the peak latency, amplitude, and channel for the detected peak.
     """
-    derivatives_root = Path(__file__).resolve().parent.parent / "derivatives" / "evoked"
+    derivatives_root = Path(__file__).resolve().parent.parent / "derivatives" / "evoked" / "v2_online-reference" / "batch_2"
     assert derivatives_root.exists()
     # Use peak_finder on our xarray dataset representaion of evoked data
     if method == "xarray":
@@ -323,10 +323,10 @@ def main(
         dfs = pd.concat(dfs)
     # Save the results to disk
     dfs.to_csv(
-        derivatives_root.parent /
+        derivatives_root.parent.parent.parent /
         "peaks" /
         "v2_online-reference" /
-        f"peaks_{method}_{extrema}_{age}.csv"
+        f"peaks_{method}_{extrema}_{age}_batch-2.csv"
         )
     return dfs
 
