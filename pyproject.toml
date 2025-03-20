@@ -7,10 +7,14 @@ requires-python = ">=3.10"
 dependencies = [
     "defusedxml>=0.7.1",
     "mne-bids>=0.16.0",
-    "python-picard>=0.8",
     "seaborn>=0.13.2",
-    "xarray>=2025.1.0",
 ]
 
 [project.optional-dependencies]
 notebook = ["ipykernel>=6.29.5"]
+
+[dependency-groups]
+processing = [
+    "pylossless>=0.2.0",
+    "python-picard>=0.8",
+]
