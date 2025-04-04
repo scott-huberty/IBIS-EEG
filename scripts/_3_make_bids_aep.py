@@ -2,6 +2,8 @@
 # requires-python = ">=3.10"
 # dependencies = []
 # ///
+import argparse
+from glob import glob
 from pathlib import Path
 from warnings import warn
 
@@ -10,6 +12,9 @@ import numpy as np
 import pandas as pd
 import mne
 import mne_bids
+
+import logging
+import sys
 
 # These files have known issues that need to be addressed/investigated before blindly writing to BIDS
 KNOWN_PROBLEMATIC = [
@@ -41,47 +46,140 @@ KNOWN_PROBLEMATIC = [
     "STL7151_6m_20230915_020759_cleaned_raw.fif", # some tones too close together
 ]
 
+# These files are from the 6 month visit but the filename doesnt indicate it
+SIXMONTH_FILES = [
+    "SEA7072_IBIS_05302023_20230530_010644_proc-cleaned_raw",
+    "SEA7074_IBIS_05242023_20230524_034241_proc-cleaned_raw",
+]
 
-def main():
-    df = get_fpaths_dataframe(run="02")
+# Some subjects have 2 EEG files for the same visit. The ones below should be labeled as run-02
+RUN_2_FILES = [
+    "PHI7023_V12_CVD_EEG1_20220429_1_proc-cleaned_raw",
+    "PHI7106_v06_a2__20230719_112906_proc-cleaned_raw",
+    "PHI7162_V06_final_2_20240610_053148_proc-cleaned_raw.fif", # Theres no data in this file
+    "SEA7080_V12_IBIS(2)_10272023_20231027_034802_proc-cleaned_raw",
+    "UNC7022_v6_2_20220428_1324_proc-cleaned_raw",
+    "UNC7053_v06p2_20230301_0905_proc-cleaned_raw",
+    "UNC7060_v06_p2_20230818_1040_proc-cleaned_raw",
+]
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Make BIDS AEP data from pylossless derivatives."
+    )
+    parser.add_argument(
+        "--qcr_fpath",
+        dest="qcr_fpath",
+        type=Path,
+        required=True,
+        help="Path to the directory containing the QCR derivatives. For example, /home/user/project/derivatives/QCR/run-01",
+    )
+    parser.add_argument(
+        "--events_fpath",
+        dest="events_fpath",
+        type=Path,
+        required=True,
+        help="Path to the directory containing the AEP events CSV file. For example, /home/user/project/derivatives/aep_events",
+    )
+    parser.add_argument(
+        "--bids_fpath",
+        dest="bids_fpath",
+        type=Path,
+        required=True,
+        help="Path to the directory where the BIDS data will be written. For example, /home/user/project/bids",
+    )
+    parser.add_argument(
+        "--overwrite",
+        dest="overwrite",
+        action="store_true",
+        help="Overwrite existing BIDS files.",
+    )
+    args = parser.parse_args()
+    return args
+
+
+def main(
+        *,
+        qcr_fpath: Path,
+        events_fpath: Path,
+        bids_fpath: Path,
+        overwrite: bool = False,
+        ) -> mne_bids.BIDSPath:
+    """Main function to make BIDS AEP data from pylossless derivatives."""
+    # Backwards compatibility
+    df = get_fpaths_dataframe(qcr_fpath)
+    log_df = pd.DataFrame(
+        {"filename": df["fpath"], "status": [pd.NA] * len(df)}
+    )
     for tup in df.itertuples():
-        if tup.fpath.name in KNOWN_PROBLEMATIC:
+        logger = make_logger(filename=tup.fpath.with_suffix(".log"))
+        if tup.fpath.name == "PHI7019_V06-CVD_EEG_20210924_12_proc-cleaned_raw.fif":
+            msg = f"Skipping {tup.fpath} because there is an issue where the annotations are later than the maximum time in the file."
+            logger.warning(msg)
+            log_df.loc[log_df["filename"] == tup.fpath, "status"] = msg
+            close_logger(logger)
             continue
+        events_csv = get_events_csv_fpath(tup.fpath, events_fpath)
+        logger.info(f"Processing {tup.fpath} with events CSV {events_csv}")
+        if events_csv is None or not events_csv.exists():
+            msg = f"Could not find events CSV file for {tup.fpath}"
+            logger.warning(msg)
+            log_df.loc[log_df["filename"] == tup.fpath, "status"] = msg
+            close_logger(logger)
+            continue
+        events_df = pd.read_csv(events_csv)
+
         raw = mne.io.read_raw_fif(tup.fpath)
-        raw = sanitize_aep_events(raw)
-        if raw is None:
-            continue # No ton+ annotations found
         # Make sure each bad channel is listed only once
         raw.info["bads"] = list(set(raw.info["bads"]))
         # the stable read_raw_egi reader includes a stim channel for each event type.
         # we don't need these in the BIDS data
-        stim_idxs = [idx for idx, ch
-                     in enumerate(raw.get_channel_types())
-                     if ch == "stim"
-                     ]
-        if len(stim_idxs) > 0:
-            raw.drop_channels([raw.ch_names[idx] for idx in stim_idxs])
+        raw.pick("eeg")
 
-        write_aep_to_bids(
+        # Set AEP annotations
+        # this is operated in-place on the raw object so we don't need to return anything
+        raw = set_aep_annotations(raw=raw, events_df=events_df)
+        if raw is None:
+            msg = f"Could not set AEP annotations for {tup.fpath}"
+            logger.warning(msg)
+            log_df.loc[log_df["filename"] == tup.fpath, "status"] = msg
+            close_logger(logger)
+            continue
+
+        bpath = write_aep_to_bids(
             raw=raw,
+            bids_root=bids_fpath,
             subject=tup.subject,
             session=tup.session,
             task=tup.task,
-            run=tup.run
+            run=tup.run,
+            overwrite=overwrite,
             )
         del raw
+        if bpath is None:
+            msg = f"Could not write BIDS data for {tup.fpath}"
+            logger.warning(msg)
+            log_df.loc[log_df["filename"] == tup.fpath, "status"] = msg
+            close_logger(logger)
+            continue
+        msg = f"Successfully wrote BIDS data for {tup.fpath} to {bpath}"
+        log_df.loc[log_df["filename"] == tup.fpath, "status"] = msg
+        logger.info(msg)
+    log_df.to_csv(
+        Path(__file__).parent / "logs" / f"{Path(__file__).stem}" / "report.csv",
+    )
+    df.to_csv(
+        Path(__file__).parent.parent / "assets" / "qcr_to_bids_mapping.csv",
+        index=False,
+    )
+    return bpath.root
 
 
-def get_fpaths_dataframe(run: str = "01") -> pd.DataFrame:
+def get_fpaths_dataframe(derivative_fpath) -> pd.DataFrame:
     """Return a DataFrame of pylossless derivative fpaths."""
-    fpaths = {}
-    fpaths["PHI"] = get_fpaths(site="PHI", run=run)
-    fpaths["SEA"] = get_fpaths(site="SEA", run=run)
-    fpaths["STL"] = get_fpaths(site="STL", run=run)
-    fpaths["UMN"] = get_fpaths(site="UMN", run=run)
-    fpaths["UNC"] = get_fpaths(site="UNC", run=run)
-    fpaths["extra"] = list(Path(__file__).resolve().parent.parent.glob("derivatives/pylossless/run-02/*_cleaned_raw.fif"))
-    fpaths = [fpath for fpath in fpaths.values() for fpath in fpath]
+    fpaths = glob(f"{derivative_fpath}/*/*_proc-cleaned_raw.fif")
+    fpaths = [Path(fpath) for fpath in fpaths]
     df = pd.DataFrame(
         {
             "fpath": fpaths,
@@ -94,38 +192,21 @@ def get_fpaths_dataframe(run: str = "01") -> pd.DataFrame:
     df["subject"] = df["fpath"].apply(get_bids_subject_from_fpath)
     df["session"] = df["fpath"].apply(get_bids_session_from_fpath)
     df["task"] = "aep"
+    df["run"] = df["fpath"].apply(get_bids_run_from_fpath)
     # Find multiple runs
-    duplicates_1 = df.loc[df.duplicated(subset=["subject", "session"], keep="first")]
-    duplicates_2 = df.loc[df.duplicated(subset=["subject", "session"], keep="last")]
-    df["run"] = 1
-    # duplicates_1 actually contains the second run
-    for ii, _ in duplicates_1.iterrows():
-        df.at[ii, "run"] = 2
+    # duplicates_1 = df.loc[df.duplicated(subset=["subject", "session"], keep="first")]
+    # duplicates_2 = df.loc[df.duplicated(subset=["subject", "session"], keep="last")]
+    # df["run"] = 1
+    # # duplicates_1 actually contains the second run
+    # for ii, _ in duplicates_1.iterrows():
+    #    df.at[ii, "run"] = 2
     return df
 
-
-def get_fpaths(
-        site: str,
-        derivative: str = "pylossless",
-        run: str = "01"
-        ) -> list[Path]:
-    """Return a list of pylossless derivative fpaths."""
-    assert site in ["PHI", "SEA", "STL", "UMN", "UNC"]
-    site_dirname = f"{site}-IBIS"
-    dpath = (
-        Path("/Users/scotterik/Downloads") /
-            site_dirname /
-            "derivatives" /
-            derivative /
-            f"run-{run}"
-        )
-
-    fpaths = list(dpath.glob("*_cleaned_raw.fif"))
-    return fpaths
 
 
 def get_bids_subject_from_fpath(fpath: Path) -> str:
     """Return the BIDS entities from the fpath."""
+    fpath = Path(fpath)
     fname = fpath.stem
     # This is a dummy way to get the subject, but it works for now
     subject = fname[:7]
@@ -135,241 +216,134 @@ def get_bids_subject_from_fpath(fpath: Path) -> str:
         subject = parts[0] + parts[1][:4]
     return subject
 
+
 def get_bids_session_from_fpath(fpath: Path) -> int:
     """Return the BIDS entities from the fpath."""
+    fpath = Path(fpath)
     fname = fpath.stem.lower()
-    is_6m = "v06" in fname or "6m" in fname or "v6" in fname or "v0.6" in fname
+    is_6m = "v06" in fname or "6m" in fname or "v6" in fname or "v0.6" in fname or fpath.stem in SIXMONTH_FILES
     is_12m = "v12" in fname or "12m" in fname
     return 6 if is_6m else 12 if is_12m else 999
 
-
-def find_aep_start_stop(raw: mne.io.BaseRaw) -> tuple[int, int]:
-    """Find the start and stop indices of the AEP in the raw data."""
-    # These files have peculiarities that require manual start-stop settings
-    MANUAL_START_STOP = {
-        # Looks like they stopped the AEP task (or ran it a second time) and when it started again the DINS weren't dropping. Let's crop the task to the portions where we ahve both ton+ and DIN1 events  noqa: 501
-        "PHI7109_v12_20240123_20240123_114841_cleaned_raw.fif": (493, 638),
-        "STL7068-6M_20180106_061903_cleaned_raw.fif": (762, 874),
-        "STL7111_6m_20220411_092225_cleaned_raw.fif": (834, 870),
-        }
-    if raw.filenames[0].name in MANUAL_START_STOP:
-        return MANUAL_START_STOP[raw.filenames[0].name]
-    # Find the start of the AEP
-    tone_annot_idxs = np.where(raw.annotations.description == "ton+")[0]
-    if len(tone_annot_idxs) == 0:
-        warn(f"No ton+ annotations found in {raw.filenames[0].name}.")
-        return (None, None)
-    start = int(
-        np.min(raw.annotations.onset[tone_annot_idxs])
-        ) - 1
-    # Find time in seconds of the end of the AEP task.
-    if "AEP-" in raw.annotations.description:
-        # XXX: If AEP was run twice this will crop to the end of the first run...
-        stop = int(
-            raw.annotations.onset[
-                np.where(raw.annotations.description == "AEP-")[0]
-                ][0]
-            )
-    else:
-        stop = int(
-            np.max(raw.annotations.onset[tone_annot_idxs])
-            ) + 1.5 # 1.5 seconds after the last tone onset
-    if stop > raw.times[-1]:
-        stop = raw.times[-1]
-    return start, stop
+def get_bids_run_from_fpath(fpath: Path) -> int:
+    """Return the BIDS entities from the fpath."""
+    fpath = Path(fpath)
+    is_run_2 = fpath.stem in RUN_2_FILES
+    return 2 if is_run_2 else 1
 
 
-def drop_these_annotations(raw: mne.io.BaseRaw) -> list[int]:
-    """Find the indices of irrelevant annotations in the raw data."""
-    unwanted_annots = [
-        "ITI+", # Intertrial interval
-        "TRSP", # Net Station generic trigger
-        "base",
-        "AEP-", # This is the end of the AEP task
-        "Res-", # This is the end of the Rest task. Sometimes it appears at the very start of the AEP task
-        "comm", # e.g. STL7068 had one of these events during AEP
-        ]
-    irrelevant_idxs = np.where(
-        np.isin(raw.annotations.description, unwanted_annots)
-        )[0]
-    return irrelevant_idxs
-
-
-def sanitize_aep_events(raw) -> None:
-    """Standardize the events in the AEP task before saving the data to BIDS format."""
-    print(f"Sanitizing {raw.filenames[0].name}")
-    # Crop the raw data to the AEP task and remove irrelevant annotations
-    start, stop = find_aep_start_stop(raw)
-    if start is None:  # No ton+ annotations found
-        warn(f"No ton+ annotations found in {raw.filenames[0].name}.")
+def get_events_csv_fpath(fif_fpath: Path, events_fpath: Path) -> Path:
+    """Return the events CSV file path."""
+    # This is a dummy way to get the events CSV file, but it works for now
+    aep_csvs = list(events_fpath.glob("*.csv"))
+    fname = fif_fpath.stem
+    want_name = fif_fpath.with_name(f"{fname}_aep_events.csv").name
+    want_fpath = events_fpath / want_name
+    if not want_fpath.exists():
+        warn(f"Could not find events CSV file for {fif_fpath}")
         return
-    raw.crop(tmin=start, tmax=stop)
-    irrelevant_idxs = drop_these_annotations(raw)
-    raw.annotations.delete(irrelevant_idxs)
-    # ST Louis continuously drops DIN3 dins throughout the task... -_-
-    # Delete them
-    if raw.filenames[0].name.lower().startswith("stl"):
-        din_3_annot_idxs = np.where(raw.annotations.description == "DIN3")[0]
-        raw.annotations.delete(din_3_annot_idxs)
-        # e.g. one rogue DIN2 in STL7127_12m_20230706_113140_cleaned_raw.fif
-        if "DIN2" in raw.annotations.description:
-            din_2_annots_idxs = np.where(raw.annotations.description == "DIN2")[0]
-            raw.annotations.delete(din_2_annots_idxs)
-    # Now a check to make sure we only have the annotations we want
-    # UNC Does not have DIN1 events. They have both DIN193 and DIN199 events that are
-    # continuously dropped throughout the task. Keep the closest one to the ton+ event,
-    # rename it to DIN1, and delete the rest.
-    rename_dins = False
-    if raw.filenames[0].name.lower().startswith("unc"):
-        rename_dins = True
-        dins_in_raw = np.unique(raw.annotations.description)
-        dins_in_raw = [din for din in dins_in_raw if din.startswith("D")]
-    # Some files have DIN2 events instead of DIN1 events. We'll rename them to DIN1
-    elif raw.filenames[0].name in ["SEA7033_12M_20220201_105005_cleaned_raw.fif"]:
-        rename_dins = True
-        dins_in_raw = np.unique(raw.annotations.description)
-        dins_in_raw = [din for din in dins_in_raw if din.startswith("DIN2")]
-    if rename_dins:
-        din_map = {
-            din: "DIN1" for din in dins_in_raw
-            }
-        raw.annotations.rename(din_map)
-        rename_dins = False
+    else:
+        csv_fpath_idx = aep_csvs.index(want_fpath)
+        csv_fpath = aep_csvs[csv_fpath_idx]
+        if csv_fpath == -1:
+            raise RuntimeError(f"Could not find events CSV file for {fif_fpath}")
+    assert want_fpath == csv_fpath
+    return want_fpath
 
 
-    current_annotations = raw.annotations
-    aep_events = [
-        "ton+",
-        "DIN1",
-        "DIN2" # e.g. SEA7033_12M_20220201_105005_cleaned_raw.fif has DIN2 events
-        ]
-    want_cond = (
-        np.isin(current_annotations.description, aep_events) |
-        np.char.startswith(current_annotations.description,"BAD_")
-        )
-    assert np.all(want_cond)
-    # Now we need to find the first stimtracker onset after the ton+ event
-    # we'll rename it to a a special name and delete the ton+ and DIN1 annotations
-    # this way we can just have the tones true onset in the data. much cleaner!
-    # For most sites, the DIN1 event happens within 50ms of the ton+ event
-    threshold = .07 if raw.filenames[0].name.lower().startswith("unc") else .05  # time in ms, i.e. 0.05 seconds = 50ms
-    true_tone_annots = get_true_tone_annotations(raw, threshold=threshold)
-    lossless_annots = get_lossless_annotations(raw)
-    # Sanity check. tone onsets probably shouldn't be less than 1-second apart
-    # The filenames below are known to have deviations from this rule
-    KNOWN_DEVIATIONS = [
-        "PHI7105_v06_20230728_101131_cleaned_raw.fif", # tone index 68 is only 75ms apart
-        "PHI7109_v12_20240123_20240123_114841_cleaned_raw.fif", # tone index 96 is only 65ms apart
-        "PHI7094_V12_20231016_121721_cleaned_raw.fif", # tone index 29 is 220ms apart
-        "PHI7085_V12_20231024_110416_cleaned_raw.fif", # a tone just 97ms apart
-        "PHI7083_V12_20230911_020303_cleaned_raw.fif", # a few tones are ~220ms apart
-        "PHI7109_v12_20240123_20240123_114841_cleaned_raw.fif", # one tone is ~60ms apart
-        "PHI7111_V06_20230810_20230810_024408_cleaned_raw.fif", # one tone is ~80ms apart
-        "UMN7037_v6_20230620_100742_cleaned_raw.fif", # a few tones just over 2sec apart
-        # A lot of UNC files, the first ton+ event has no DIN1 event within 50ms of it
-        "UNC7024_V6_20220322_0913_cleaned_raw.fif", # a tone over 2sec apart
-        # The files below are the second batch I processed.abs
-        "UNC7017_12m 20220221 1446_cleaned_raw.fif", # a tone over 2sec apart
-        "UMN7042_v6_cleaned_raw.fif",  # some tones just over 2sec apart
-        "UMN7015_12mo_20220222_101741_cleaned_raw.fif", # some tones just over 2sec apart
-        "UNC7047_v06 20230303 0920_cleaned_raw.fif", # some tones just over 2sec apart
-        "UMN7024_6mo_20220617_101125_cleaned_raw.fif", # some tones just over 2sec apart
-        "UMN7049_v6_20230715_113354_cleaned_raw.fif", # some tones just over 2sec apart
-    ]
-    if raw.filenames[0].name not in KNOWN_DEVIATIONS:
-        diffs = np.diff(true_tone_annots.onset)
-        # UNC site continuously drops D192 and D193 events, so will definitely have some
-        # tones that are less than 50ms apart. We'll just delete them to be safe.
-        if raw.filenames[0].name.lower().startswith("unc"):
-            too_close_idx = np.where(diffs < .95)[0]
-            if len(too_close_idx) > 0:
-                true_tone_annots.delete(too_close_idx)
-                diffs = np.diff(true_tone_annots.onset)
-        assert np.all(diffs > .95) # .95 to account for rounding
-        # But also not more than 2-seconds apart...
-        assert np.all(diffs < 2.1) # 2.1 to account for rounding
-    # Sanitize
-    # import matplotlib.pyplot as plt; import pdb; pdb.set_trace()
-    raw.set_annotations(true_tone_annots + lossless_annots)
-    raw.annotations.rename({"DIN1": "tone"})
-    # Sanity check
-    want_cond = (
-        np.isin(raw.annotations.description, ["tone"]) |
-        np.char.startswith(raw.annotations.description,"BAD_")
-        )
-    assert np.all(want_cond)
+def set_aep_annotations(
+        raw: mne.io.BaseRaw,
+        events_df: pd.DataFrame
+        ) -> mne.io.BaseRaw:
+    """Set the AEP annotations in the raw data."""
+    # Read the AEP events CSV file
+    df = events_df
+    true_tone_counts = df["is_true_tone_onset"].value_counts()
+    if True not in true_tone_counts:
+        warn(f"Could not find any true tone onsets in {raw.filenames[0].name}")
+        return
+    df_tone_triggers = df.loc[df["description"] == "ton+"].copy()
+    df_tone_onsets = df.loc[df["is_true_tone_onset"] == True].copy()  # noqa E501
+    tone_trigger_idxs = df_tone_triggers["annotation_index"].values
+    tone_trigger_idxs = np.where(raw.annotations.description == "ton+")[0]
+    tone_onset_idxs = df_tone_onsets["annotation_index"].values
+    lossless_annots_idxs = get_lossless_annotations(raw)
+    assert (raw.annotations.description[tone_trigger_idxs] == "ton+").all()
+    assert np.isin(raw.annotations.description[tone_onset_idxs], ["DIN1", "D193", "D199"]).all()
+    assert (np.char.startswith(raw.annotations.description[lossless_annots_idxs], "BAD_")).all()
+
+    annot_idxs_to_keep = np.concatenate([lossless_annots_idxs, tone_trigger_idxs, tone_onset_idxs])
+    annot_idxs_to_drop = np.ones(len(raw.annotations.description), dtype=bool)
+    annot_idxs_to_drop[annot_idxs_to_keep] = False
+    assert len(annot_idxs_to_drop) > 0, f"Nothing to drop in {raw.filenames[0]}"
+    assert "ton+" not in np.unique(raw.annotations.description[annot_idxs_to_drop])
+    assert not (np.char.startswith(raw.annotations.description[annot_idxs_to_drop], "BAD_")).any()
+    # Remove the unwanted annotations
+    raw.annotations.delete(annot_idxs_to_drop)
+    del tone_trigger_idxs
+    del tone_onset_idxs
+    annot_descs_to_rename = {}
+    if "DIN1" in raw.annotations.description:
+        annot_descs_to_rename["DIN1"] = "tone_onset"
+    if "D193" in raw.annotations.description:
+        annot_descs_to_rename["D193"] = "tone_onset"
+    if "D199" in raw.annotations.description:
+        annot_descs_to_rename["D199"] = "tone_onset"
+    if len(annot_descs_to_rename) == 0:
+        raise RuntimeError(f"Could not find any tone annotations in {raw.filenames[0].name}")
+    if len(annot_descs_to_rename) > 2:
+        raise RuntimeError(f"Found multiple tone annotations in {raw.filenames[0].name}: {annot_descs_to_rename}")
+    # Rename the annotations to "tone"
+    annots_copy = raw.annotations.copy()
+    annots_copy.rename(annot_descs_to_rename)
+    # Let's keep ton+, DIN, and the new tone_onset annotations for posterity
+    raw.set_annotations(raw.annotations + annots_copy)
+    # raw.annotations.rename({desc: "tone_onset" for desc in annot_descs_to_rename})
+    # raw.annotations.rename({"ton+": "tone_trigger"})
+
+    first_tone = raw.annotations.onset[raw.annotations.description == "ton+"][0]
+    last_tone = raw.annotations.onset[raw.annotations.description == "tone_onset"][-1]
+    assert last_tone <= raw.times[-1]
+    crop_tmin = max(first_tone - 2, 0)
+    crop_tmax = min(last_tone + 2, raw.times[-1])
+    raw.crop(tmin=crop_tmin, tmax=crop_tmax)
     return raw
-
-      
-def get_true_tone_annotations(raw, threshold=.05):
-    """Return a subset of the annotations containing only the first DIN1 after a ton+ event."""
-    first_din_idxs = []
-    for ii, annot in enumerate(raw.annotations):
-        # is_first_din = False
-        threshold = threshold  # time in ms, i.e. 0.05 seconds = 50ms
-        if annot["description"] == "ton+":
-            # compare onset of this ton+ event to all other events.
-            diffs = np.abs(raw.annotations.onset - annot["onset"]) < threshold
-            diffs_indices = np.where(diffs)[0]
-            # The current annotation will be included in the diff calculation (with a diff of 0) so we need to remove it
-            diffs_indices = [idx for idx in diffs_indices if idx != ii]
-            # And we need to remove bad_ annotations that happen to be within 50ms of the ton+ event
-            diffs_indices = [idx for idx in diffs_indices if not raw.annotations[idx]["description"].startswith("BAD_")]
-            if len(diffs_indices) == 0:
-                # For some reason in the UNC site, the first ton+ event has no DIN1 event within 50ms of it
-                if raw.filenames[0].name.lower().startswith("unc") and ii == 1:
-                    continue
-                # The first ton+ in this file has no DIN1 event within 50ms of it
-                elif raw.filenames[0].name in ["SEA7033_12M_20220201_105005_cleaned_raw.fif"]:
-                    continue
-                raise ValueError(f"No DIN1 found within {threshold} seconds of this ton+ annotation: {annot}")
-            # Since the  UNC site continuously drops D192 and D193 events, there
-            # probably will be multiple DIN events that occur within 50ms of the ton+
-            # event. So we just have to accept that reality, take the closest one to the
-            # ton+ event, and move on.
-            # For the other sites, we can test that there is only one DIN1 event within 
-            # 50ms of the ton+ event.
-            if not raw.filenames[0].name.lower().startswith("unc"):
-                assert len(diffs_indices) == 1, f"More than one DIN1 found within {threshold} seconds of a ton+ event."
-            first_din_idxs.append(diffs_indices[0])
-    return raw.annotations[first_din_idxs]
 
 
 def get_lossless_annotations(raw):
     """Return a subset of the annotations containing only annotations that start with BAD_."""
-    return raw.annotations[
-        np.where(
+    return np.where(
             np.char.startswith(raw.annotations.description, "BAD_")
         )[0]
-    ]
 
 
 def write_aep_to_bids(
+        *,
         raw: mne.io.BaseRaw,
+        bids_root: Path,
         subject: str,
         session: int,
         task: str,
-        run: int) -> None:
+        run: int,
+        overwrite: bool = False,
+        ) -> None:
     """Write the AEP data to BIDS format."""
-    root = Path(__file__).resolve().parent.parent / "bids" / "v2"
-    root.mkdir(exist_ok=True)
+    assert raw.filenames[0].parent.parent.parent.parent.name == "derivatives"
 
-    if not (root / "dataset_description.json").exists():
+    if not (bids_root / "dataset_description.json").exists():
         mne_bids.make_dataset_description(
-            path=root,
+            path=bids_root,
             name="IBIS EP",
             dataset_type="derivative",
             authors=["Scott Huberty", "Bonnie Lau", "Madison Booth"],
             funding=["NIH"],
         )
 
-    if session == 999:
-        session = None
     session = str(session).zfill(2)
     run = str(run).zfill(2)
 
     bids_path = mne_bids.BIDSPath(
-        root=root,
+        root=bids_root,
         subject=subject,
         session=session,
         task=task,
@@ -377,18 +351,56 @@ def write_aep_to_bids(
         description="cleaned",
         datatype="eeg",
     )
-    if bids_path.fpath.exists():
-        print(f"{bids_path.fpath} already exists. Skipping.")
-        return
-    mne_bids.write_raw_bids(
+    return mne_bids.write_raw_bids(
         raw=raw,
         bids_path=bids_path,
         montage=raw.get_montage(),
         format="BrainVision",
         allow_preload=True,
-        overwrite=True,
+        overwrite=overwrite,
         )
 
- 
+
+
+def make_logger(*, filename: str, level: int = logging.INFO) -> logging.Logger:
+    import datetime
+
+    logger = logging.getLogger(f"Logger for AEP annotation for {filename}")
+    logger.setLevel(level)
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(level)
+    logger.addHandler(console_handler)
+    # File handler
+    today = datetime.date.today()
+    log_dir = Path(__file__).parent / "logs" / f"{Path(__file__).stem}" / f"{today}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{Path(filename).stem}_log.txt"
+    # log_path = Path(filename).parent.parent / "logs" / f"{Path(filename).stem}_log.txt"
+    if log_path.exists():
+        log_path.unlink()
+    file_handler = logging.FileHandler(log_path, mode="a")
+    file_handler.setLevel(level)
+    logger.addHandler(file_handler)
+    return logger
+
+
+def close_logger(logger: logging.Logger):
+    for handler in logger.handlers:
+        handler.close()
+        logger.removeHandler(handler)
+
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    qcr_fpath = args.qcr_fpath
+    events_fpath = args.events_fpath
+    bids_fpath = args.bids_fpath
+    overwrite = args.overwrite
+    main(
+        qcr_fpath=qcr_fpath,
+        events_fpath=events_fpath,
+        bids_fpath=bids_fpath,
+        overwrite=overwrite,
+        )
