@@ -59,10 +59,8 @@ def get_xr_evoked_aep(raw, bids_path):
     sfreq = raw.info["sfreq"]
     assert len(raw.ch_names) == 129
 
-    epochs = mne.Epochs(raw, event_id="tone", reject=dict(eeg=200e-6), preload=True)
-    #epochs.set_eeg_reference(
-    #    ref_channels=[ch for ch in epochs.ch_names if ch not in epochs.info["bads"]]
-    #    )
+    epochs = mne.Epochs(raw, event_id="tone_onset", reject=dict(eeg=200e-6), preload=True)
+    epochs.set_eeg_reference("average")
     epochs.interpolate_bads()
     evoked = epochs.average()
     xr_ev = xr.DataArray(
