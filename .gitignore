@@ -12,3 +12,7 @@ derivatives/*
 
 # VS code workspace
 *.code-workspace
+
+# ignore log files
+scripts/logs/**.out
+!scripts/logs/.gitkeep
