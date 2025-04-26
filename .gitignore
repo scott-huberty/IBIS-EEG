@@ -15,4 +15,6 @@ derivatives/*
 
 # ignore log files
 scripts/logs/**.out
+scripts/logs/*_*/
 !scripts/logs/.gitkeep
+
