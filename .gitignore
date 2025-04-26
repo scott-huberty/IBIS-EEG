@@ -2,6 +2,10 @@
 .venv
 
 # Don't track any of our data files
+
+sourcedata/*
+!sourcedata/.gitkeep
+
 bids/*
 # But do track the .gitkeep file
 !bids/.gitkeep
