@@ -4,6 +4,11 @@
 # ///
 import argparse
 import glob
+
+import logging
+import re
+import sys
+
 from pathlib import Path
 
 import mne
@@ -12,8 +17,11 @@ import numpy as np
 import pandas as pd
 
 # The channels to use for peak detection. These are the central channels
-CHANNELS = ["E30", "E7", "E106", "E29", "E13", "E6", "E112"]
-
+ROI = {
+    "GSN-HydroCel-129": ["E7", "E106", "E13", "E6", "E112", "E31", "E80", "E37", "E55", "E87"],
+    "GSN-HydroCel-65": ["E16", "E15", "E51", "E4", "E54", "E21", "E41", "E34"],
+}
+DERIVATIVE_DIR = Path(__file__).resolve().parent.parent / "derivatives"
 
 def parse_args():
     """Parse user defined arguments from the command line."""
@@ -34,6 +42,14 @@ def parse_args():
               " the dataframe returned by 'xarray' contains the peak latency and amplitude."
               )
         )
+    parser.add_argument(
+        "--derivative_fpath",
+        dest="derivative_fpath",
+        type=Path,
+        required=False,
+        default=None,
+        help="Path to the derivatives directory. If not specified, will use the default path."
+    )
     # By default we will use the 06 session for peak detection
     parser.add_argument(
         "--session",
@@ -65,6 +81,7 @@ def parse_args():
         help="Whether to plot the ERP and detected peaks. Default is False."
     )
     return parser.parse_args()
+
 
 def get_peaks_from_evoked(
     fpath,
@@ -100,25 +117,38 @@ def get_peaks_from_evoked(
     import seaborn as sns
     import matplotlib.pyplot as plt
    
-    evoked = mne.read_evokeds(fpath)[0].pick(CHANNELS)
+    evoked = mne.read_evokeds(fpath)[0]
+    if "E128" in evoked.ch_names:
+        montage = "GSN-HydroCel-129"
+    else:
+        assert len(evoked.ch_names) == 65
+        montage = "GSN-HydroCel-65"
+    CHANNELS = ROI["GSN-HydroCel-65"]
+    evoked.pick(CHANNELS)
     # below we have some hardcoded values that assume the data is 500Hz
     assert evoked.info["sfreq"] == 500
 
     tmin, tmax = .08, 0.2
-    ch_name, latency, amplitude = evoked.get_peak(
-        ch_type="eeg",
-        tmin=tmin,
-        tmax=tmax,
-        mode="pos",
-        return_amplitude=True,
-        )
+    try:
+        ch_name, latency, amplitude = evoked.get_peak(
+            ch_type="eeg",
+            tmin=tmin,
+            tmax=tmax,
+            mode="pos",
+            return_amplitude=True,
+            )
+    except ValueError as e:
+        return e
     name = fpath.name
-    file = name[:18]
+    file = name[:27]
     data = np.array([ch_name, latency, amplitude])
     df = pd.DataFrame([data], columns=["ch_name", "latency", "amplitude"], index=[file])
+    df["montage"] = montage
+    df["n_trials"] = evoked.nave
+    df["age"] = re.search(r"ses-(\d+)", file).group(1)
 
     if plot:
-        out_dir = fpath.parent.parent.parent.parent / "peaks" / "v2_online-reference" / "plots" / "mne-positive"
+        out_dir = DERIVATIVE_DIR / "peaks" / "plots"
         out_dir.mkdir(exist_ok=True, parents=True)
         fig, ax = plt.subplots(constrained_layout=True)
         data = evoked.get_data(picks=[ch_name]).squeeze()
@@ -177,6 +207,10 @@ def get_peaks_xarray(
     import xarray as xr
 
     ds = xr.open_dataset(fpath)
+    if "E128" in ds.channel.values:
+        CHANNELS = ROI["GSN-HydroCel-129"]
+    else:
+        CHANNELS = ROI["GSN-HydroCel-65"]
     da = ds.to_array().sel(channel=CHANNELS).mean("channel").squeeze()
     dfs = []
     exclude_age = "ses-12" if age == "06" else "ses-06"
@@ -274,6 +308,7 @@ def plot_peaks(da, df, *, extrema):
 def main(
     method,
     *, # enforce keyword arguments
+    derivative_fpath=None,
     age,
     positive_peaks=True,
     negative_troughs=True,
@@ -302,8 +337,12 @@ def main(
     pd.DataFrame
         DataFrame containing the peak latency, amplitude, and channel for the detected peak.
     """
-    derivatives_root = Path(__file__).resolve().parent.parent / "derivatives" / "evoked" / "v2_online-reference" / "batch_2"
-    assert derivatives_root.exists()
+    if derivative_fpath is None:
+       derivatives_root = Path(__file__).resolve().parent.parent / "derivatives" / "evoked" / "v2_online-reference" / "batch_2"
+    else:
+        derivatives_root = Path(derivative_fpath).expanduser().resolve()
+    assert derivatives_root.exists(), f"Path {derivatives_root} does not exist. Please specify a valid path via --derivative_fpath"
+    
     # Use peak_finder on our xarray dataset representaion of evoked data
     if method == "xarray":
         fpath = derivatives_root / "aep_evoked.nc"
@@ -319,20 +358,61 @@ def main(
         assert len(fpaths)
         dfs = []
         for fpath in fpaths:
-            dfs.append(get_peaks_from_evoked(Path(fpath), plot=plot))
+            logger = make_logger(fpath)
+            logger.info(
+                f" Finding peaks for {fpath} with the following parameters:\n"
+                f"  Method: {method}\n"
+                f"  Age: {age}\n"
+                f"  Positive Peaks: {positive_peaks}\n"
+                f"  Negative Troughs: {negative_troughs}\n"
+                f"  Plot: {plot}\n"
+                )
+            fpath = Path(fpath)
+            this_df = get_peaks_from_evoked(fpath, plot=plot)
+            if isinstance(this_df, ValueError):
+                logger.error(
+                    f" Error in peak detection for {fpath}:\n"
+                    f"  {this_df}\n"
+                    )
+                close_logger(logger)
+                continue
+            dfs.append(this_df)
+            logger.info(f" Peak detection complete for {fpath}")
+            close_logger(logger)
         dfs = pd.concat(dfs)
     # Save the results to disk
     dfs.to_csv(
-        derivatives_root.parent.parent.parent /
+        DERIVATIVE_DIR /
         "peaks" /
-        "v2_online-reference" /
-        f"peaks_{method}_{extrema}_{age}_batch-2.csv"
+        f"peaks_{method}_{extrema}_{age}.csv"
         )
     return dfs
+
+
+
+def make_logger(fpath):
+    fpath = Path(fpath)
+    log_name = fpath.name[:27]
+    log_fpath = DERIVATIVE_DIR / "peaks" / "logs"
+    log_fpath.mkdir(exist_ok=True, parents=True)
+    file_handler = logging.FileHandler(log_fpath / f"{log_name}_peak_detection.log")
+    file_handler.setLevel(logging.INFO)
+    logger = mne.utils.logger
+    logger.addHandler(file_handler)
+    return logger
+
+
+def close_logger(logger):
+    for handler in logger.handlers:
+        handler.close()
+        logger.removeHandler(handler)
+    logger.handlers.clear()
+    return
 
 if __name__ == "__main__":
     args = parse_args()
     method = args.method
+    derivative_fpath = args.derivative_fpath
     age = args.session
     extrema = args.extrema
     positive_peaks = True if extrema in ["positive", "both"] else False
@@ -340,6 +420,7 @@ if __name__ == "__main__":
     plot=args.plot
     main(
         method=method,
+        derivative_fpath=derivative_fpath,
         age=age,
         positive_peaks=positive_peaks,
         negative_troughs=negative_troughs,
